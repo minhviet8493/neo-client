@@ -1,0 +1,7 @@
+node_modules/
+dist/
+out/
+*.aix
+config.local.js
+.config.local.*
+.DS_Store

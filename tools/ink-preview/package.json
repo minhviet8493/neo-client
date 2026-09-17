@@ -1,0 +1,14 @@
+{
+  "name": "neo-ink-preview",
+  "private": true,
+  "type": "module",
+  "description": "Pack the Neo AIUI agent and render it in the real Ink wasm runtime with a mocked backend.",
+  "scripts": {
+    "pack": "mkdir -p dist && aix pack ../.. -o dist/neo-glasses.aix"
+  },
+  "dependencies": {
+    "@yodaos-pkg/aix-cli": "0.8.2",
+    "@yodaos-pkg/ink": "0.17.1",
+    "playwright-core": "1.63.0"
+  }
+}

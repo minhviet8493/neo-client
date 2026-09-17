@@ -1,0 +1,11 @@
+.git/
+.claude/
+tests/
+tools/
+scripts/
+.github/
+README.md
+CLAUDE.md
+.gitignore
+*.aix
+node_modules/

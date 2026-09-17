@@ -1,0 +1,12 @@
+{
+  "pages": [
+    "pages/index/index"
+  ],
+  "window": {
+    "navigationBarTitleText": "NEO"
+  },
+  "permissions": [
+    "RECORD_AUDIO",
+    "INTERNET"
+  ]
+}
