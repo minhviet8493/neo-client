@@ -16,27 +16,8 @@ function loadWx() {
   } catch (_) { return Promise.resolve(missing()); }
 }
 
-// The device token never lives in this public repository: it is read from config.local.js,
-// which is packaged into the AIX but kept out of git. A static import of a missing module would
-// fail the whole page, so the file is loaded lazily.
-let deviceToken = '';
-let tokenLoaded = false;
-function loadToken() {
-  if (tokenLoaded) return Promise.resolve(deviceToken);
-  const done = value => {
-    tokenLoaded = true;
-    deviceToken = typeof value === 'string' ? value.trim() : '';
-    return deviceToken;
-  };
-  try {
-    return import('../../config.local.js').then(
-      module => done(module && module.default && module.default.deviceToken),
-      () => done('')
-    );
-  } catch (_) { return Promise.resolve(done('')); }
-}
 const NEO_BASE_URL = 'https://neo-core.1click24.ru';
-const VERSION = '3.3';
+const VERSION = '4.0';
 const CONNECT_TIMEOUT_MS = 10000;
 const REQUEST_TIMEOUT_MS = 40000;
 const START_TIMEOUT_MS = 8000;
@@ -75,7 +56,14 @@ const ACTIONS = ['talk', 'menu'];
 const HISTORY_TURNS = 20;
 const PREFS_KEY = 'neo.preferences.v5';
 const OLD_PREFS_KEYS = ['neo.preferences.v4', 'neo.preferences.v3'];
-const DEVICE_KEY = 'neo.device.v1';
+// No secret ships with this repository. The glasses ask the server for access, the owner
+// confirms the request in the Telegram bot, and only then does the server enroll the device.
+const ACCESS_KEY = 'neo.access.v1';
+const OLD_DEVICE_KEY = 'neo.device.v1';
+// A stored confirmation is reused until the build changes or a month passes.
+const ACCESS_MAX_AGE_MS = 30 * 24 * 3600 * 1000;
+const PAIR_POLL_MS = 2000;
+const PAIR_WAIT_MS = 200000;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 // Ink's clearTimeout throws for anything but a timer number.
@@ -277,7 +265,8 @@ export default {
   // ---- lifecycle -------------------------------------------------------
 
   onLoad() {
-    loadToken();
+    // Enrollments made with the embedded token are dropped: 4.0 asks the owner in Telegram.
+    if (readLocal(OLD_DEVICE_KEY)) writeLocal(OLD_DEVICE_KEY, null);
     // Neo server recognition is the only recognizer (Rokid host ASR cannot do Russian on
     // AIUI 0.17). Older settings carry over, except that 2.7 starts in free conversation.
     const saved = readLocal(PREFS_KEY);
@@ -319,7 +308,6 @@ export default {
 
   onShow() {
     loadWx();
-    loadToken();
     this.guard('show', () => {
       if (!this.connection && !this.connecting) return this.connect();
     });
@@ -1103,16 +1091,6 @@ export default {
   // silent: re-authenticate in the background during a question, without touching the UI.
   async connect({ silent = false } = {}) {
     if (this.connecting) return !!this.connection;
-    if (!tokenLoaded) await loadToken();
-    if (!deviceToken) {
-      this.connecting = false;
-      this.report('app_start', 'token:missing');
-      if (silent) return false;
-      this.clearHistory('Нет токена устройства. Добавьте в проект файл config.local.js:'
-        + ' export default { deviceToken: "…" }; — и соберите пакет заново.');
-      this.setPhase('offline', 'Токен устройства не найден.');
-      return false;
-    }
     this.connecting = true;
     stopTimer(this.connectTimer);
     this.connectTimer = null;
@@ -1132,21 +1110,30 @@ export default {
       return false;
     };
     try {
-      let token = deviceToken;
-      const saved = readLocal(DEVICE_KEY);
-      if (saved && typeof saved.refresh_token === 'string') {
-        try {
-          const renewed = await this.request('/v1/auth/refresh', { body: { refresh_token: saved.refresh_token }, timeout: CONNECT_TIMEOUT_MS });
-          if (renewed.ok && renewed.data && typeof renewed.data.access_token === 'string') token = renewed.data.access_token;
-          else if (renewed.status === 401) writeLocal(DEVICE_KEY, null);
-        } catch (_) {}
+      const stored = readLocal(ACCESS_KEY);
+      let token = await this.renew(stored);
+      if (!token) {
+        // Never ask the owner in the background: a confirmation must follow a visible request.
+        if (silent) {
+          this.connecting = false;
+          this.connection = null;
+          return false;
+        }
+        const paired = await this.pair();
+        token = paired.token;
+        if (!token) {
+          if (paired.reason === 'network') return offline('Нет связи с Neo: проверьте интернет телефона.');
+          this.connecting = false;
+          this.connection = null;
+          return false;
+        }
       }
       const check = await this.request('/v1/auth/check', { token, body: {}, timeout: CONNECT_TIMEOUT_MS });
       const info = check.data;
       if (!check.ok || !info || info.status !== 'ok' || typeof info.user_id !== 'string' || typeof info.device_id !== 'string') {
-        if (check.status === 401) writeLocal(DEVICE_KEY, null);
+        if (check.status === 401) writeLocal(ACCESS_KEY, null);
         return offline(check.status === 401
-          ? 'Токен Neo истёк: обновите токен клиента.'
+          ? 'Доступ Neo отозван. Коснитесь «Говорить», чтобы подтвердить заново.'
           : check.status === 429 ? 'Слишком много попыток.'
           : 'Сервер Neo отказал (HTTP ' + check.status + ').');
       }
@@ -1167,7 +1154,6 @@ export default {
       this.report('app_start', 'prefs voice:' + this.prefs.voice + ' talk:' + this.prefs.talk
         + ' mic:' + (this.prefs.sensitive ? 'quiet' : 'normal'));
       this.flushEvents();
-      if (!saved && token === deviceToken) this.enroll(token);
       const first = !readLocal(PREFS_KEY);
       if (first) writeLocal(PREFS_KEY, this.prefs);
       if (!this.history.length) {
@@ -1212,13 +1198,82 @@ export default {
     return result;
   },
 
-  async enroll(token) {
+  // Reuse an earlier confirmation. Returns '' when the owner has to confirm again.
+  async renew(stored) {
+    if (!stored || typeof stored.refresh_token !== 'string') return '';
+    if (stored.build !== VERSION || !(Date.now() - Number(stored.at || 0) < ACCESS_MAX_AGE_MS)) {
+      this.report('pair', 'stored:' + (stored.build === VERSION ? 'expired' : 'build'));
+      writeLocal(ACCESS_KEY, null);
+      return '';
+    }
     try {
-      const result = await this.request('/v1/auth/enroll', { token, timeout: CONNECT_TIMEOUT_MS });
-      if (result.ok && result.data && typeof result.data.refresh_token === 'string') {
-        writeLocal(DEVICE_KEY, { refresh_token: result.data.refresh_token });
+      const renewed = await this.request('/v1/auth/refresh', { body: { refresh_token: stored.refresh_token }, timeout: CONNECT_TIMEOUT_MS });
+      if (renewed.ok && renewed.data && typeof renewed.data.access_token === 'string') {
+        this.report('pair', 'stored:ok');
+        return renewed.data.access_token;
+      }
+      if (renewed.status === 401) {
+        writeLocal(ACCESS_KEY, null);
+        this.report('pair', 'stored:revoked');
       }
     } catch (_) {}
+    return '';
+  },
+
+  // Ask the owner for access and wait for the button in Telegram. The code on the screen is
+  // the one the bot shows, so the owner can see that this request is really from the glasses.
+  async pair() {
+    let started;
+    try {
+      started = await this.request('/v1/pair/start', { body: { label: 'glasses ' + VERSION }, timeout: CONNECT_TIMEOUT_MS });
+    } catch (_) {
+      this.report('pair', 'start:network');
+      return { token: '', reason: 'network' };
+    }
+    const data = started.data || {};
+    const error = data.error || {};
+    if (!started.ok || typeof data.pair_id !== 'string' || typeof data.code !== 'string') {
+      this.report('pair', 'start:' + safeToken(error.code || 'http').slice(0, 20), started.status);
+      this.clearHistory(error.code === 'pair_unbound'
+        ? 'Telegram ещё не привязан. Откройте бота NEO, отправьте /start и коснитесь «Говорить».'
+        : (error.message || 'Сервер Neo не отвечает (HTTP ' + started.status + ').'));
+      this.setPhase('offline', 'Доступ не подтверждён.');
+      return { token: '', reason: 'server' };
+    }
+    const code = String(data.code).slice(0, 4);
+    this.report('pair', 'start:ok');
+    this.clearHistory('Подтвердите доступ в Telegram.\nКод: ' + code.slice(0, 2) + '-' + code.slice(2)
+      + '\nОткройте бота NEO, сверьте код и нажмите «Подтвердить».');
+    this.setPhase('connecting', 'Жду подтверждения в Telegram…');
+    const step = Math.max(1000, Number(data.poll_interval) * 1000 || PAIR_POLL_MS);
+    const until = Date.now() + Math.min(PAIR_WAIT_MS, (Number(data.expires_in) || 180) * 1000);
+    while (Date.now() < until) {
+      await this.delay(step);
+      let polled;
+      try {
+        polled = await this.request('/v1/pair/poll', { body: { pair_id: data.pair_id }, timeout: CONNECT_TIMEOUT_MS });
+      } catch (_) { continue; }
+      const body = polled.data || {};
+      if (body.status === 'approved' && typeof body.access_token === 'string') {
+        if (typeof body.refresh_token === 'string') {
+          writeLocal(ACCESS_KEY, { refresh_token: body.refresh_token, build: VERSION, at: Date.now() });
+        }
+        this.report('pair', 'approved');
+        return { token: body.access_token, reason: 'ok' };
+      }
+      if (body.status === 'denied' || body.status === 'expired') {
+        this.report('pair', body.status);
+        this.clearHistory(body.status === 'denied'
+          ? 'Доступ отклонён в Telegram. Коснитесь «Говорить», чтобы запросить снова.'
+          : 'Время подтверждения вышло. Коснитесь «Говорить», чтобы запросить снова.');
+        this.setPhase('offline', 'Доступ не подтверждён.');
+        return { token: '', reason: body.status };
+      }
+    }
+    this.report('pair', 'timeout');
+    this.clearHistory('Подтверждение из Telegram не пришло. Коснитесь «Говорить», чтобы запросить снова.');
+    this.setPhase('offline', 'Доступ не подтверждён.');
+    return { token: '', reason: 'timeout' };
   },
 
   // ---- chat ----------------------------------------------------------------

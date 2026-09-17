@@ -21,7 +21,8 @@ cd tools/ink-preview && npm install && npm run pack    # -> dist/neo-glasses.aix
 `run.sh` renders the package in the real Ink wasm runtime (Docker + the Playwright image) with a
 mocked Neo backend, writes PNG screenshots and prints the page console. Keys: `Enter` = tap,
 `ArrowUp`/`ArrowDown`/`ArrowLeft`/`ArrowRight` = swipes, `GlobalHook` = temple touch,
-`Backspace` = back. `MOCK=long|huge` returns longer answers. The web host cannot recognize or
+`Backspace` = back. `MOCK=long|huge` returns longer answers; `MOCK=pair` keeps the approval
+screen up (nobody presses the button in the bot). The web host cannot recognize or
 synthesize speech, so voice paths are covered only by the Node tests and on the glasses.
 
 ## Layout
@@ -31,9 +32,12 @@ synthesize speech, so voice paths are covered only by the Node tests and on the 
 - `AGENTS.md` — the agent's identity and description; Rokid uses it to invoke the agent.
 - `app.json` — pages, window title, `RECORD_AUDIO` and `INTERNET` permissions.
 - `.aixignore` — keeps `tests/`, `tools/`, `.git/`, `.claude/` and docs out of the AIX package.
-- `config.local.js` — the device token, **never committed** (this repository is public) but
-  packaged into the AIX; `config.local.example.js` shows the shape. `neo-core`'s
-  `scripts/embed_client_token.py --client <path>` writes it.
+- No secret of any kind lives here. Access is granted per device: `pair()` asks
+  `/v1/pair/start`, shows the four-digit code, polls `/v1/pair/poll` until the owner presses
+  Подтвердить in the Telegram bot, and stores only the resulting refresh token in
+  `neo.access.v1` (`{refresh_token, build, at}`). `renew()` reuses it while the build matches
+  and it is under 30 days old; a silent reconnection during a question must never pair, because
+  a confirmation has to follow a request the owner can see on the glasses.
 - `.claude/skills/aiui-dev` — the official Rokid reference. **Load it before editing** and use
   only the APIs, components and WXSS it lists.
 
@@ -62,11 +66,12 @@ synthesize speech, so voice paths are covered only by the Node tests and on the 
 
 ## Tests
 
-`tests/page.test.cjs` extracts the `<script setup>` block, swaps the lazy `import('../../config.local.js')`
-for a fake module and `export default` for a global, and runs it in `node:vm` with a fake host:
-manual clock, throwing `clearTimeout`, fake `wx`, recorder, speech synthesis and `/v1/ask`
-Server-Sent Events. The suite also fails if a secret-looking literal appears in the page or if
-`config.local.js` is missing from `.gitignore` or listed in `.aixignore`.
+`tests/page.test.cjs` extracts the `<script setup>` block, swaps `export default` for a global,
+and runs it in `node:vm` with a fake host: manual clock, throwing `clearTimeout`, fake `wx`,
+recorder, speech synthesis and `/v1/ask` Server-Sent Events. `ready()` starts from a device the
+owner has already confirmed (`confirmed()` seeds `neo.access.v1`); pairing has its own tests
+that use `host()` plus `boot()`. The suite fails if a secret-looking literal appears in the page
+or if a token file reappears in the repository.
 
 Passing Node tests and Ink web renders do not prove speech recognition or synthesis on the
 physical glasses; report those separately.

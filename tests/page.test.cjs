@@ -7,10 +7,14 @@ const path = require('node:path');
 const ink = fs.readFileSync(path.join(__dirname, '../pages/index/index.ink'), 'utf8');
 const script = ink.match(/<script setup>([\s\S]*?)<\/script>/)[1];
 const template = ink.match(/<page>([\s\S]*?)<\/page>/)[1];
-const source = script
-  .replace("import('../../config.local.js')", 'globalThis.__config()')
-  .replace('export default', 'globalThis.page =');
-const TOKEN = 'test-device-token-' + 'a'.repeat(40);
+const source = script.replace('export default', 'globalThis.page =');
+const VERSION = ink.match(/const VERSION = '([^']+)'/)[1];
+const ACCESS_KEY = 'neo.access.v1';
+const NOW = 1_000_000;
+// A device the owner has already confirmed in Telegram: it only renews its access.
+const confirmed = (extra = {}) => ({
+  [ACCESS_KEY]: JSON.stringify(Object.assign({ refresh_token: 'r'.repeat(64), build: VERSION, at: NOW }, extra))
+});
 const ID = '54b1dc37-2a21-43ed-8d5b-200e987ed51f';
 const plain = value => JSON.parse(JSON.stringify(value));
 const flush = async (rounds = 8) => { for (let i = 0; i < rounds; i++) await new Promise(r => setImmediate(r)); };
@@ -55,7 +59,7 @@ function response(status, body, binary) {
 
 // Builds a page inside a fake Ink host with a controllable clock.
 function host(options = {}) {
-  let now = 1_000_000;
+  let now = NOW;
   let seq = 0;
   const timers = new Map();
   const requests = [];
@@ -63,8 +67,9 @@ function host(options = {}) {
   const storage = new Map(Object.entries(options.storage || {}));
   const routes = Object.assign({
     '/v1/auth/check': () => response(200, { status: 'ok', user_id: 'minh', device_id: 'rokid-simulator', expires_at: '2099-01-01T00:00:00Z' }),
-    '/v1/auth/enroll': () => response(200, { access_token: 'neo1.a.b.c', refresh_token: 'r'.repeat(64) }),
     '/v1/auth/refresh': () => response(200, { access_token: 'neo1.renewed.b.c' }),
+    '/v1/pair/start': () => response(200, { pair_id: 'p'.repeat(32), code: '4821', expires_in: 180, poll_interval: 2 }),
+    '/v1/pair/poll': () => response(200, { status: 'approved', access_token: 'neo1.paired.b.c', refresh_token: 'n'.repeat(64) }),
     '/v1/chat': () => response(200, { session_id: ID, message: 'Ответ Neo.', provider: 'openai', request_id: ID, sources: [] }),
     '/v1/transcribe': () => response(200, { text: 'Привет, Нео', request_id: ID }),
     '/v1/speech': () => response(200, undefined, new Int16Array(2400).buffer),
@@ -104,10 +109,6 @@ function host(options = {}) {
   };
   const played = [];
   const globals = {
-    // Stands in for the lazy import of config.local.js.
-    __config: () => options.noToken
-      ? Promise.reject(new Error('missing'))
-      : Promise.resolve({ default: { deviceToken: TOKEN } }),
     console: { log() {}, error() {} },
     Date: FakeDate,
     AbortController,
@@ -222,8 +223,18 @@ function host(options = {}) {
   return env;
 }
 
-async function ready(options) {
-  const env = host(options);
+async function boot(env, ms = 6000) {
+  env.page.onLoad();
+  env.page.onShow();
+  await flush();
+  await env.advance(ms);
+  return env;
+}
+
+async function ready(options = {}) {
+  const env = host(Object.assign({}, options, {
+    storage: Object.assign(confirmed(), options.storage)
+  }));
   env.page.onLoad();
   env.page.onShow();
   await flush();
@@ -266,26 +277,114 @@ async function glassesTap(env) {
 const selected = env => env.page.data.actions.findIndex(a => a.cls.includes('action-on'));
 const menuFocus = env => env.page.data.menuRows.find(r => r.cls.includes('row-on')).id;
 
-test('connects with the embedded token and enrolls a renewable binding', async () => {
+test('a confirmed device only renews its access, without asking the owner again', async () => {
   const env = await ready();
-  const check = env.requests.find(r => r.route === '/v1/auth/check');
-  assert.equal(check.init.headers.Authorization, 'Bearer ' + TOKEN);
-  assert.ok(env.requests.some(r => r.route === '/v1/auth/enroll'));
-  assert.equal(JSON.parse(env.storage.get('neo.device.v1')).refresh_token, 'r'.repeat(64));
+  assert.deepEqual(env.requests.map(r => r.route).filter(r => r !== '/v1/diagnostics'), ['/v1/auth/refresh', '/v1/auth/check']);
+  assert.equal(env.requests[1].init.headers.Authorization, 'Bearer neo1.renewed.b.c');
   assert.equal(env.page.data.actions[0].label, 'Говорить');
   assert.match(env.text(), /Коснитесь/);
   assert.deepEqual(plain(env.page.data.statusLines), [], 'the status line is hidden when all is well');
 });
 
-test('a saved binding is renewed and used instead of the embedded token', async () => {
-  const env = await ready({ storage: { 'neo.device.v1': JSON.stringify({ refresh_token: 'x'.repeat(64) }) } });
-  assert.deepEqual(env.requests.map(r => r.route).filter(r => r !== '/v1/diagnostics'), ['/v1/auth/refresh', '/v1/auth/check']);
-  assert.equal(env.requests[1].init.headers.Authorization, 'Bearer neo1.renewed.b.c');
+test('a fresh install shows the code and starts working once the owner confirms', async () => {
+  let status = 'pending';
+  const env = host({ routes: {
+    '/v1/pair/poll': () => response(200, status === 'pending'
+      ? { status: 'pending', expires_in: 120, poll_interval: 2 }
+      : { status: 'approved', access_token: 'neo1.paired.b.c', refresh_token: 'n'.repeat(64) })
+  } });
+  env.page.onLoad();
+  env.page.onShow();
+  await flush();
+  const start = env.requests.find(r => r.route === '/v1/pair/start');
+  assert.deepEqual(start.body, { label: 'glasses ' + VERSION });
+  assert.ok(!start.init.headers.Authorization, 'nothing to authenticate with yet');
+  // The code on the screen is what the bot shows, so the owner can compare them.
+  assert.match(env.text(), /48-21/);
+  assert.match(env.text(), /Telegram/);
+  assert.equal(env.page.data.phase, 'connecting');
+  await env.advance(4000);
+  assert.equal(env.page.data.phase, 'connecting', 'it keeps waiting for the button');
+  status = 'approved';
+  await env.advance(2000);
+  assert.equal(env.page.data.phase, 'idle');
+  assert.equal(env.requests.find(r => r.route === '/v1/auth/check').init.headers.Authorization, 'Bearer neo1.paired.b.c');
+  const saved = JSON.parse(env.storage.get(ACCESS_KEY));
+  assert.deepEqual(saved, { refresh_token: 'n'.repeat(64), build: VERSION, at: env.now });
+  // Telemetry can only travel once there is access, so the pairing events flush afterwards.
+  env.page.flushEvents();
+  await flush();
+  assert.match(telemetry(env), /"pair","phase":"connecting","detail":"approved"/);
+});
+
+test('a new build and a month-old confirmation both ask the owner again', async () => {
+  const build = await boot(host({ storage: confirmed({ build: '0.1' }) }));
+  assert.ok(build.requests.some(r => r.route === '/v1/pair/start'));
+  assert.equal(build.requests.find(r => r.route === '/v1/auth/refresh'), undefined, 'a stale binding is not renewed');
+  assert.equal(build.page.data.phase, 'idle');
+  assert.equal(JSON.parse(build.storage.get(ACCESS_KEY)).build, VERSION);
+
+  const old = await boot(host({ storage: confirmed({ at: NOW - 31 * 24 * 3600 * 1000 }) }));
+  assert.ok(old.requests.some(r => r.route === '/v1/pair/start'));
+  assert.equal(old.page.data.phase, 'idle');
+});
+
+test('a revoked binding asks the owner again, and a refusal leaves Neo locked', async () => {
+  const denied = host({
+    storage: confirmed(),
+    routes: {
+      '/v1/auth/refresh': () => response(401, { error: { code: 'unauthorized' } }),
+      '/v1/pair/poll': () => response(200, { status: 'denied' })
+    }
+  });
+  denied.page.onLoad();
+  denied.page.onShow();
+  await flush();
+  await denied.advance(2000);
+  assert.equal(denied.storage.get(ACCESS_KEY), undefined, 'the revoked binding is forgotten');
+  assert.equal(denied.page.data.phase, 'offline');
+  assert.match(denied.text(), /отклонён/);
+  assert.equal(denied.requests.filter(r => r.route === '/v1/auth/check').length, 0, 'no access without the owner');
+
+  // Asking again is one tap away, and only the owner's press unlocks it.
+  await denied.tap();
+  await flush();
+  assert.equal(denied.requests.filter(r => r.route === '/v1/pair/start').length, 2);
+});
+
+test('an unconfirmed request times out and an unbound bot is explained', async () => {
+  const waiting = host({ routes: { '/v1/pair/poll': () => response(200, { status: 'pending', expires_in: 10, poll_interval: 2 }) } });
+  waiting.page.onLoad();
+  waiting.page.onShow();
+  await flush();
+  await waiting.advance(200000);
+  assert.equal(waiting.page.data.phase, 'offline');
+  assert.match(waiting.text(), /Коснитесь/);
+  assert.equal(waiting.storage.get(ACCESS_KEY), undefined);
+
+  const unbound = host({ routes: { '/v1/pair/start': () => response(409, { error: { code: 'pair_unbound', message: 'Откройте бота NEO в Telegram и отправьте /start.' } }) } });
+  unbound.page.onLoad();
+  unbound.page.onShow();
+  await flush();
+  assert.match(unbound.text(), /\/start/);
+  assert.equal(unbound.requests.filter(r => r.route === '/v1/pair/poll').length, 0);
+});
+
+test('a lost binding during a question never asks the owner in the background', async () => {
+  const env = await ready({ routes: {
+    '/v1/ask': () => response(401, { error: { code: 'unauthorized' } }),
+    '/v1/auth/refresh': ({ count }) => count > 1 ? response(401, {}) : response(200, { access_token: 'neo1.renewed.b.c' })
+  } });
+  await env.tap();
+  await sayPhrase(env, { lead: 3, speak: false });
+  await flush(16);
+  assert.equal(env.requests.filter(r => r.route === '/v1/pair/start').length, 0, 'a background request must never notify the owner');
+  assert.match(env.status(), /Доступ/);
 });
 
 test('an offline start keeps retrying by itself and says so', async () => {
   let online = false;
-  const env = host({ routes: { '/v1/auth/check': () => {
+  const env = host({ storage: confirmed(), routes: { '/v1/auth/check': () => {
     if (!online) throw new Error('offline');
     return response(200, { status: 'ok', user_id: 'minh', device_id: 'd' });
   } } });
@@ -313,7 +412,7 @@ test('one request carries the question and streams the answer back', async () =>
   assert.equal(chats(env).length, 0);
   const ask = asks(env)[0];
   assert.equal(ask.init.headers.Accept, 'text/event-stream');
-  assert.equal(ask.init.headers.Authorization, 'Bearer ' + TOKEN);
+  assert.equal(ask.init.headers.Authorization, 'Bearer neo1.renewed.b.c');
   assert.deepEqual(Object.keys(ask.body).sort(), ['client_message_id', 'device_id', 'user_id', 'wav_base64']);
   const wav = Buffer.from(ask.body.wav_base64, 'base64');
   assert.equal(wav.toString('ascii', 0, 4), 'RIFF');
@@ -850,12 +949,10 @@ test('app manifest declares the microphone and the agent description', () => {
   assert.ok(app.permissions.includes('RECORD_AUDIO'));
   const agents = fs.readFileSync(path.join(__dirname, '../AGENTS.md'), 'utf8');
   assert.match(agents, /\*\*Description\*\*: NEO/);
-  // The token file is packaged into the AIX but never committed.
-  const aixignore = fs.readFileSync(path.join(__dirname, '../.aixignore'), 'utf8');
-  assert.ok(!/config\.local/.test(aixignore), 'the token file must reach the glasses');
-  const gitignore = fs.readFileSync(path.join(__dirname, '../.gitignore'), 'utf8');
-  assert.match(gitignore, /^config\.local\.js$/m);
-  assert.ok(fs.existsSync(path.join(__dirname, '../config.local.example.js')));
+  // 4.0 ships no secret at all: access is granted by the owner in Telegram.
+  assert.ok(!/config\.local/.test(script), 'no token file is read any more');
+  assert.ok(!fs.existsSync(path.join(__dirname, '../config.local.js')));
+  assert.ok(!fs.existsSync(path.join(__dirname, '../config.local.example.js')));
   // This repository is public: no token may appear in the source.
   const literals = [...script.matchAll(/'([^'\n]*)'|"([^"\n]*)"/g)].map(match => match[1] ?? match[2]);
   const known = [
@@ -866,7 +963,7 @@ test('app manifest declares the microphone and the agent description', () => {
     assert.ok(known.includes(literal) || !/^[A-Za-z0-9_-]{32,}$/.test(literal),
       'secret-looking literal: ' + literal.slice(0, 8) + '…');
   }
-  assert.ok(!/NEO_DEVICE_TOKEN/.test(script), 'the token is loaded from config.local.js');
+  assert.ok(!/NEO_DEVICE_TOKEN/.test(script), 'access is granted per device, not by a shared token');
 });
 
 test('the conversation continues by itself and pauses after ten silent seconds', async () => {
@@ -901,15 +998,8 @@ test('a scrollbar shows how much of the conversation is visible', async () => {
 });
 
 
-test('without config.local.js Neo explains what to do', async () => {
-  const env = host({ noToken: true });
-  env.page.onLoad();
-  env.page.onShow();
-  await flush();
-  assert.equal(env.page.data.phase, 'offline');
-  assert.match(env.text(), /config\.local\.js/);
-  assert.equal(env.requests.length, 0, 'nothing is sent without a token');
-  env.page.flushEvents();
-  await flush();
-  assert.equal(env.requests.length, 0);
+test('an enrollment from before 4.0 is dropped, not silently reused', async () => {
+  const env = await ready({ storage: { 'neo.device.v1': JSON.stringify({ refresh_token: 'x'.repeat(64) }) } });
+  assert.equal(env.storage.get('neo.device.v1'), undefined);
+  assert.equal(env.requests.filter(r => r.body && r.body.refresh_token === 'x'.repeat(64)).length, 0);
 });

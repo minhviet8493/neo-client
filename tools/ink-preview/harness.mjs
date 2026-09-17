@@ -32,6 +32,7 @@ const tag = () => new Date().toISOString().slice(17, 23);
 ctx.on('console', m => log.push(`${tag()} [console.${m.type()}] ${m.text()}`));
 ctx.on('weberror', e => log.push(`${tag()} [pageerror] ${e.error().message}`));
 const mode = process.env.MOCK || 'ok';
+let polls = 0;
 await ctx.route('https://neo-core.1click24.ru/**', async route => {
   const req = route.request();
   const p = new URL(req.url()).pathname;
@@ -42,6 +43,13 @@ await ctx.route('https://neo-core.1click24.ru/**', async route => {
   if (p === '/v1/auth/check') return json(200, { status: 'ok', user_id: 'minh', device_id: 'rokid-simulator', expires_at: '2099-01-01T00:00:00Z', budget: {} });
   if (p === '/v1/auth/enroll') return json(200, { access_token: 'neo1.1.a.b', expires_at: '2099-01-01T00:00:00Z', refresh_token: 'r'.repeat(64), refresh_expires_at: '2099-01-01T00:00:00Z' });
   if (p === '/v1/auth/refresh') return json(200, { access_token: 'neo1.1.a.b', expires_at: '2099-01-01T00:00:00Z' });
+  // Owner approval: the code shows for one poll, then the "button" is pressed. MOCK=pair waits.
+  if (p === '/v1/pair/start') { polls = 0; return json(200, { pair_id: 'p'.repeat(32), code: '4821', expires_in: 180, poll_interval: 2 }); }
+  if (p === '/v1/pair/poll') {
+    polls += 1;
+    if (mode === 'pair' || polls < 2) return json(200, { status: 'pending', expires_in: 120, poll_interval: 2 });
+    return json(200, { status: 'approved', access_token: 'neo1.1.a.b', expires_at: '2099-01-01T00:00:00Z', refresh_token: 'r'.repeat(64), refresh_expires_at: '2099-01-01T00:00:00Z' });
+  }
   if (p === '/v1/diagnostics') {
     for (const event of JSON.parse(req.postData() || '{}').events || []) log.push(`${tag()} [event] ${event.code} ${event.phase || ''} ${event.detail || ''} ${event.value ?? ''}`);
     return route.fulfill({ status: 204, headers: { 'access-control-allow-origin': '*' } });
