@@ -368,7 +368,7 @@ export default {
   },
 
   talkLabel() {
-    if (!this.connection) return this.connecting ? '…' : 'Связь';
+    if (!this.connection) return this.connecting ? 'Ждём…' : 'Подключить';
     return ACTIVE_PHASES.includes(this.phase) ? 'Стоп' : 'Говорить';
   },
 
@@ -380,7 +380,7 @@ export default {
   render() {
     const labels = { talk: this.talkLabel(), menu: 'Меню' };
     const hints = {
-      main: 'Свайп: листать · касание: ' + (this.selected === 1 ? 'меню' : 'говорить'),
+      main: 'Свайп: листать · касание: ' + (this.selected === 1 ? 'меню' : this.talkLabel().toLowerCase().replace('…', '')),
       menu: 'Свайп: пункт · касание: изменить · назад: выход',
       info: 'Свайп: прокрутка · касание: выход'
     };
@@ -801,7 +801,7 @@ export default {
 
   toggleTalk() {
     this.stopMicTest();
-    if (!this.connection) return this.connect();
+    if (!this.connection) return this.connect({ ask: true });
     if (this.voice || this.chat) {
       this.stopVoice();
       this.cancelChat();
@@ -886,7 +886,7 @@ export default {
     else if (item.id === 'up') return this.openMenu('main', 'service');
     else if (item.id === 'diagnostics') { this.returnItem = 'diagnostics'; return this.showDiagnostics(); }
     else if (item.id === 'mictest') { this.returnItem = 'mictest'; return this.startMicTest('wx'); }
-    else if (item.id === 'reconnect') { this.connection = null; this.goMain(); return this.connect(); }
+    else if (item.id === 'reconnect') { this.connection = null; this.goMain(); return this.connect({ ask: true }); }
     else if (item.id === 'back') return this.goMain();
     if (item.id === 'voice' && p.voice === 'on') this.speakRokid('Голос включён.', null);
     writeLocal(PREFS_KEY, p);
@@ -1089,7 +1089,7 @@ export default {
   },
 
   // silent: re-authenticate in the background during a question, without touching the UI.
-  async connect({ silent = false } = {}) {
+  async connect({ silent = false, ask = false } = {}) {
     if (this.connecting) return !!this.connection;
     this.connecting = true;
     stopTimer(this.connectTimer);
@@ -1109,6 +1109,15 @@ export default {
       }, delay);
       return false;
     };
+    // Waiting for the owner's button: no background retries, nothing sent until it is pressed.
+    const locked = message => {
+      this.connecting = false;
+      this.connection = null;
+      this.connectAttempts = 0;
+      this.clearHistory(message);
+      this.setPhase('offline', 'Нажмите «Подключить».');
+      return false;
+    };
     try {
       const stored = readLocal(ACCESS_KEY);
       let token = await this.renew(stored);
@@ -1119,12 +1128,15 @@ export default {
           this.connection = null;
           return false;
         }
+        if (!ask) return locked('NEO не подключён. Нажмите «Подключить» — запрос на доступ придёт вам в Telegram.');
         const paired = await this.pair();
         token = paired.token;
         if (!token) {
           if (paired.reason === 'network') return offline('Нет связи с Neo: проверьте интернет телефона.');
           this.connecting = false;
           this.connection = null;
+          // pair() drew its message while the request was still open: show the button again.
+          this.render();
           return false;
         }
       }
@@ -1133,7 +1145,7 @@ export default {
       if (!check.ok || !info || info.status !== 'ok' || typeof info.user_id !== 'string' || typeof info.device_id !== 'string') {
         if (check.status === 401) writeLocal(ACCESS_KEY, null);
         return offline(check.status === 401
-          ? 'Доступ Neo отозван. Коснитесь «Говорить», чтобы подтвердить заново.'
+          ? 'Доступ Neo отозван. Нажмите «Подключить», чтобы подтвердить заново.'
           : check.status === 429 ? 'Слишком много попыток.'
           : 'Сервер Neo отказал (HTTP ' + check.status + ').');
       }
@@ -1235,9 +1247,9 @@ export default {
     if (!started.ok || typeof data.pair_id !== 'string' || typeof data.code !== 'string') {
       this.report('pair', 'start:' + safeToken(error.code || 'http').slice(0, 20), started.status);
       this.clearHistory(error.code === 'pair_unbound'
-        ? 'Telegram ещё не привязан. Откройте бота NEO, отправьте /start и коснитесь «Говорить».'
+        ? 'Telegram ещё не привязан. Откройте бота NEO, отправьте /start и нажмите «Подключить».'
         : (error.message || 'Сервер Neo не отвечает (HTTP ' + started.status + ').'));
-      this.setPhase('offline', 'Доступ не подтверждён.');
+      this.setPhase('offline', 'Нажмите «Подключить».');
       return { token: '', reason: 'server' };
     }
     const code = String(data.code).slice(0, 4);
@@ -1264,15 +1276,15 @@ export default {
       if (body.status === 'denied' || body.status === 'expired') {
         this.report('pair', body.status);
         this.clearHistory(body.status === 'denied'
-          ? 'Доступ отклонён в Telegram. Коснитесь «Говорить», чтобы запросить снова.'
-          : 'Время подтверждения вышло. Коснитесь «Говорить», чтобы запросить снова.');
-        this.setPhase('offline', 'Доступ не подтверждён.');
+          ? 'Доступ отклонён в Telegram. Нажмите «Подключить», чтобы запросить снова.'
+          : 'Время подтверждения вышло. Нажмите «Подключить», чтобы запросить снова.');
+        this.setPhase('offline', 'Нажмите «Подключить».');
         return { token: '', reason: body.status };
       }
     }
     this.report('pair', 'timeout');
-    this.clearHistory('Подтверждение из Telegram не пришло. Коснитесь «Говорить», чтобы запросить снова.');
-    this.setPhase('offline', 'Доступ не подтверждён.');
+    this.clearHistory('Подтверждение из Telegram не пришло. Нажмите «Подключить», чтобы запросить снова.');
+    this.setPhase('offline', 'Нажмите «Подключить».');
     return { token: '', reason: 'timeout' };
   },
 

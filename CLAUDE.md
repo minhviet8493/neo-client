@@ -32,7 +32,10 @@ synthesize speech, so voice paths are covered only by the Node tests and on the 
 - `AGENTS.md` — the agent's identity and description; Rokid uses it to invoke the agent.
 - `app.json` — pages, window title, `RECORD_AUDIO` and `INTERNET` permissions.
 - `.aixignore` — keeps `tests/`, `tools/`, `.git/`, `.claude/` and docs out of the AIX package.
-- No secret of any kind lives here. Access is granted per device: `pair()` asks
+- No secret of any kind lives here. Access is granted per device, and only on an explicit
+  press: a start-up merely renews a stored confirmation, and `connect({ask: true})` — the
+  «Подключить» button or Сервис → Переподключить — is the one path that notifies the owner.
+  `pair()` asks
   `/v1/pair/start`, shows the four-digit code, polls `/v1/pair/poll` until the owner presses
   Подтвердить in the Telegram bot, and stores only the resulting refresh token in
   `neo.access.v1` (`{refresh_token, build, at}`). `renew()` reuses it while the build matches

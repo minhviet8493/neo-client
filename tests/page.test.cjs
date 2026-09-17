@@ -231,6 +231,15 @@ async function boot(env, ms = 6000) {
   return env;
 }
 
+// Nothing reaches the owner until the button is pressed, so unconfirmed tests press it.
+async function unlock(env, ms = 6000) {
+  assert.equal(env.page.data.actions[0].label, 'Подключить');
+  assert.equal(env.requests.filter(r => r.route === '/v1/pair/start').length, 0, 'a start-up must not notify the owner');
+  await env.tap();
+  await env.advance(ms);
+  return env;
+}
+
 async function ready(options = {}) {
   const env = host(Object.assign({}, options, {
     storage: Object.assign(confirmed(), options.storage)
@@ -296,6 +305,10 @@ test('a fresh install shows the code and starts working once the owner confirms'
   env.page.onLoad();
   env.page.onShow();
   await flush();
+  // The glasses wait on the button: «Подключить» is what sends the request to Telegram.
+  assert.equal(env.page.data.phase, 'offline');
+  assert.match(env.text(), /Подключить/);
+  await unlock(env, 0);
   const start = env.requests.find(r => r.route === '/v1/pair/start');
   assert.deepEqual(start.body, { label: 'glasses ' + VERSION });
   assert.ok(!start.init.headers.Authorization, 'nothing to authenticate with yet');
@@ -318,13 +331,13 @@ test('a fresh install shows the code and starts working once the owner confirms'
 });
 
 test('a new build and a month-old confirmation both ask the owner again', async () => {
-  const build = await boot(host({ storage: confirmed({ build: '0.1' }) }));
+  const build = await unlock(await boot(host({ storage: confirmed({ build: '0.1' }) })));
   assert.ok(build.requests.some(r => r.route === '/v1/pair/start'));
   assert.equal(build.requests.find(r => r.route === '/v1/auth/refresh'), undefined, 'a stale binding is not renewed');
   assert.equal(build.page.data.phase, 'idle');
   assert.equal(JSON.parse(build.storage.get(ACCESS_KEY)).build, VERSION);
 
-  const old = await boot(host({ storage: confirmed({ at: NOW - 31 * 24 * 3600 * 1000 }) }));
+  const old = await unlock(await boot(host({ storage: confirmed({ at: NOW - 31 * 24 * 3600 * 1000 }) })));
   assert.ok(old.requests.some(r => r.route === '/v1/pair/start'));
   assert.equal(old.page.data.phase, 'idle');
 });
@@ -342,6 +355,7 @@ test('a revoked binding asks the owner again, and a refusal leaves Neo locked', 
   await flush();
   await denied.advance(2000);
   assert.equal(denied.storage.get(ACCESS_KEY), undefined, 'the revoked binding is forgotten');
+  await unlock(denied);
   assert.equal(denied.page.data.phase, 'offline');
   assert.match(denied.text(), /отклонён/);
   assert.equal(denied.requests.filter(r => r.route === '/v1/auth/check').length, 0, 'no access without the owner');
@@ -349,6 +363,7 @@ test('a revoked binding asks the owner again, and a refusal leaves Neo locked', 
   // Asking again is one tap away, and only the owner's press unlocks it.
   await denied.tap();
   await flush();
+  await denied.advance(2000);
   assert.equal(denied.requests.filter(r => r.route === '/v1/pair/start').length, 2);
 });
 
@@ -357,15 +372,18 @@ test('an unconfirmed request times out and an unbound bot is explained', async (
   waiting.page.onLoad();
   waiting.page.onShow();
   await flush();
+  await unlock(waiting, 0);
   await waiting.advance(200000);
   assert.equal(waiting.page.data.phase, 'offline');
-  assert.match(waiting.text(), /Коснитесь/);
+  assert.match(waiting.text(), /Подключить/);
+  assert.equal(waiting.page.data.actions[0].label, 'Подключить');
   assert.equal(waiting.storage.get(ACCESS_KEY), undefined);
 
   const unbound = host({ routes: { '/v1/pair/start': () => response(409, { error: { code: 'pair_unbound', message: 'Откройте бота NEO в Telegram и отправьте /start.' } }) } });
   unbound.page.onLoad();
   unbound.page.onShow();
   await flush();
+  await unlock(unbound, 0);
   assert.match(unbound.text(), /\/start/);
   assert.equal(unbound.requests.filter(r => r.route === '/v1/pair/poll').length, 0);
 });
