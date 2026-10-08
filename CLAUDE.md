@@ -18,6 +18,9 @@ cd tools/ink-preview && npm install && npm run pack    # -> dist/neo-glasses.aix
 ./run.sh dist/neo-glasses.aix out/check wait:2500 shot:idle key:Enter wait:1000 shot:talk
 ```
 
+`CAMERA=1` installs a stand-in camera for the preview (the browser has none) and `MOCK=unsure`
+makes the poker stream answer with an uncertain card.
+
 `run.sh` renders the package in the real Ink wasm runtime (Docker + the Playwright image) with a
 mocked Neo backend, writes PNG screenshots and prints the page console. Keys: `Enter` = tap,
 `ArrowUp`/`ArrowDown`/`ArrowLeft`/`ArrowRight` = swipes, `GlobalHook` = temple touch,
@@ -28,7 +31,9 @@ synthesize speech, so voice paths are covered only by the Node tests and on the 
 ## Layout
 
 - `pages/index/index.ink` — the whole client: `<script def>` config, `<script setup>` logic,
-  `<page>` template, `<style>`.
+  `<page>` template, `<style>`. One page, several screens (`this.screen`): the conversation
+  feed, the menu, the info screen (diagnostics, mic test, camera probe) and `noob`, the poker
+  trainer that photographs the table and shows the arithmetic of the hand.
 - `AGENTS.md` — the agent's identity and description; Rokid uses it to invoke the agent.
 - `app.json` — pages, window title, `RECORD_AUDIO` and `INTERNET` permissions.
 - `.aixignore` — keeps `tests/`, `tools/`, `.git/`, `.claude/` and docs out of the AIX package.
@@ -66,6 +71,11 @@ synthesize speech, so voice paths are covered only by the Node tests and on the 
 - Gestures (`key()`/`gesture()`) follow the sequences recorded from the glasses: a swipe is
   `GlobalHook` then an arrow pair, a tap is `GlobalHook` then `Enter` ~500 ms later.
 - `recorder.start()` must run synchronously inside the tap handler (no `await` before it).
+- `camera.takePhoto({})` has the same rule and two more: the options argument is **not**
+  optional (a bare call throws "Error calling function with 0 argument(s)"), and a tap on the
+  glasses is decided inside a timer, which is not a valid call site. НУБ therefore queues the
+  shot and fires it on the `Enter` edge of the same physical tap (`pendingShot` in `key()`).
+- There is no image decoder in the runtime: a photo can be sent or dropped, never resized.
 
 ## Tests
 

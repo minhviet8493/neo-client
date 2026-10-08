@@ -67,12 +67,42 @@ await ctx.route('https://neo-core.1click24.ru/**', async route => {
     const body = events.map(([name, data]) => `event: ${name}\ndata: ${JSON.stringify(data)}\n\n`).join('');
     return route.fulfill({ status: 200, contentType: 'text/event-stream', body, headers: { 'access-control-allow-origin': '*' } });
   }
+  if (p === '/v1/poker/new') return json(200, { hand_id: 'n'.repeat(12), players: 4, request_id: rid });
+  if (p === '/v1/poker/hand') {
+    const hole = ['A\u2665', 'K\u2665'];
+    const board = ['7\u2665', '2\u2665', '3\u2660'];
+    const events = [
+      ['reading', { request_id: rid, bytes: (req.postData() || '').length }],
+      ['cards', { hand_id: 'h'.repeat(12), hole, board, players: 4, uncertain: mode === 'unsure' ? ['3\u2660'] : [], added: board, dropped: [], new_street: true, request_id: rid }]
+    ];
+    events.push(mode === 'unsure'
+      ? ['error', { code: 'vision_uncertain', message: 'Не уверен в карте. Переснимите.', request_id: rid }]
+      : ['advice', { hole, board, players: 4, equity: 52, error: 1, trials: 10000, fair: 25, ratio: 2.08,
+          verdict: 'ВПЕРЕДИ', hand: 'старшая карта', outs: 15, outs_strong: 9,
+          outs_groups: { 'флеш': 9, 'пара': 6 }, hit_next: 32, hit_river: 54, to_come: 2,
+          draw: true, pot_aware: false, request_id: rid }]);
+    const body = events.map(([name, data]) => `event: ${name}\ndata: ${JSON.stringify(data)}\n\n`).join('');
+    return route.fulfill({ status: 200, contentType: 'text/event-stream', body, headers: { 'access-control-allow-origin': '*' } });
+  }
   if (p === '/v1/chat') {
     await new Promise(r => setTimeout(r, 300));
     return json(200, { session_id: rid, message: 'Привет! Neo на связи. '.repeat(mode === 'long' ? 30 : 1), provider: 'mock', request_id: rid, sources: [], memory_action: false, context_reset: false, budget: {} });
   }
   return json(404, {});
 });
+// The browser has no Rokid camera. CAMERA=1 installs a stand-in so the НУБ screen can be
+// rendered end to end here; without it the page takes the "no camera" path, which is also
+// worth seeing. Either way this proves nothing about the real firmware.
+if (process.env.CAMERA) {
+  await ctx.addInitScript(() => {
+    const existing = typeof globalThis.wx === 'object' && globalThis.wx ? globalThis.wx : {};
+    existing.media = existing.media || {};
+    existing.media.createCameraContext = () => ({
+      takePhoto: () => Promise.resolve({ data: new Uint8Array(4096).fill(7).buffer, mimeType: 'image/jpeg' })
+    });
+    globalThis.wx = existing;
+  });
+}
 const tab = await ctx.newPage();
 await tab.goto(`http://127.0.0.1:${port}/`);
 await tab.waitForFunction(() => /ready|error|fail/i.test(document.getElementById('preview-status')?.textContent || ''), null, { timeout: 60000 }).catch(() => {});

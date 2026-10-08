@@ -53,6 +53,24 @@ const DIRECTION_KEYS = ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'];
 const READ_STEP_ROWS = 3;
 const TELEMETRY_MS = 8000;
 const ACTIONS = ['talk', 'menu'];
+// НУБ, the poker trainer: three buttons are everything the owner touches during a hand, and
+// they sit in the same 36px bar, so they cost width rather than rows of text.
+const NOOB_ACTIONS = ['shot', 'hand', 'fold'];
+const NOOB_LABELS = { shot: 'Снять', hand: 'Раздача', fold: 'Игроков −1' };
+const NOOB_KEY = 'neo.noob.v1';
+// The server refuses a bigger photo, and nothing on the glasses can shrink one: there is no
+// image decoder in the runtime, so an oversized frame has to be reported, not resized.
+const PHOTO_MAX_BYTES = 1200000;
+// A tap is GlobalHook, then Enter ~200 ms later. If no Enter arrives, shoot from the timer and
+// let telemetry say whether the runtime accepted the call site.
+const SHOT_FALLBACK_MS = 900;
+// The display has one green channel, so a suit is only ever a glyph. Whether the firmware has
+// the glyphs at all is unknown, hence the fallback the owner can switch on.
+const SUIT_LETTERS = { '\u2660': 'п', '\u2665': 'ч', '\u2666': 'б', '\u2663': 'к' };
+
+function suitLetters(card) {
+  return String(card == null ? '' : card).replace(/[\u2660\u2665\u2666\u2663]/g, ch => SUIT_LETTERS[ch] || ch);
+}
 const HISTORY_TURNS = 20;
 const PREFS_KEY = 'neo.preferences.v5';
 const OLD_PREFS_KEYS = ['neo.preferences.v4', 'neo.preferences.v3'];
@@ -86,9 +104,14 @@ const ROWS = {
   small: { chars: 54, height: 17 },
   mono: { chars: 60, height: 16 },
   status: { chars: 56, height: 16 },
-  gap: { chars: 1, height: 8 }
+  gap: { chars: 1, height: 8 },
+  // НУБ: the verdict is the biggest thing on the screen, the disclaimer the smallest.
+  section: { chars: 56, height: 16 },
+  big: { chars: 26, height: 28 },
+  tag: { chars: 62, height: 14 },
+  data: { chars: 44, height: 20 }
 };
-const BODY_HEIGHT = { main: 264, info: 286 };
+const BODY_HEIGHT = { main: 264, info: 286, noob: 264 };
 
 function wrap(text, chars) {
   const rows = [];
@@ -275,7 +298,7 @@ export default {
     if (old && old.sensitive !== undefined) carried.sensitive = old.sensitive;
     if (old && old.voice !== undefined) carried.voice = old.voice === 'off' ? 'off' : 'on';
     if (old && old.mode === 'tap') carried.talk = 'tap';
-    this.prefs = Object.assign({ voice: 'on', talk: 'continuous', sensitive: false }, carried);
+    this.prefs = Object.assign({ voice: 'on', talk: 'continuous', sensitive: false, letters: false }, carried);
     delete this.prefs.pace;
     this.prefs.talk = this.prefs.talk === 'tap' ? 'tap' : 'continuous';
     // 3.0 keeps only settings that change behavior: the Rokid voice and microphone sensitivity.
@@ -378,19 +401,21 @@ export default {
   },
 
   render() {
-    const labels = { talk: this.talkLabel(), menu: 'Меню' };
+    const screen = this.screen || 'main';
+    const labels = Object.assign({ talk: this.talkLabel(), menu: 'Меню' }, NOOB_LABELS);
     const hints = {
       main: 'Свайп: листать · касание: ' + (this.selected === 1 ? 'меню' : this.talkLabel().toLowerCase().replace('…', '')),
       menu: 'Свайп: пункт · касание: изменить · назад: выход',
-      info: 'Свайп: прокрутка · касание: выход'
+      info: this.cameraTest ? 'Касание: снять пробное фото · назад: выход' : 'Свайп: прокрутка · касание: выход',
+      noob: 'Свайп: кнопка · касание: ' + String(NOOB_LABELS[NOOB_ACTIONS[Math.min(this.selected || 0, NOOB_ACTIONS.length - 1)]]).toLowerCase() + ' · назад: выход'
     };
     const status = this.statusVisible() ? (this.alert || this.status) : '';
-    const screen = this.screen || 'main';
+    const list = screen === 'noob' ? NOOB_ACTIONS : ACTIONS;
     // One setData per frame: the Ink runtime throttles frequent updates.
     this.setData(Object.assign({
       screen,
-      actions: ACTIONS.map((id, index) => ({ id, label: labels[id],
-        cls: 'action' + (index === this.selected ? ' action-on' : '') + (this.pressed === 'action:' + index ? ' press' : '') })),
+      actions: list.map((id, index) => ({ id, label: labels[id],
+        cls: 'action' + (screen === 'noob' ? ' action-3' : '') + (index === this.selected ? ' action-on' : '') + (this.pressed === 'action:' + index ? ' press' : '') })),
       hint: hints[screen],
       stateWord: STATE_WORDS[this.phase] || '',
       statusLines: status ? rows(status, 'status').slice(0, 2).map((row, id) => ({ id, text: row.text })) : []
@@ -403,6 +428,7 @@ export default {
   },
 
   bodyRows() {
+    if (this.screen === 'noob') return this.noobRows();
     if (this.screen === 'info') return this.infoText.flatMap(text => rows(text, 'mono'));
     const list = [];
     this.turnStarts = [];
@@ -559,6 +585,16 @@ export default {
     // Suppress the host's own scroll/focus navigation on both edges of the key.
     if (handled && typeof event.preventDefault === 'function') event.preventDefault();
     return this.guard('key', () => {
+      // takePhoto() is only accepted inside a synchronous interaction handler. On the glasses a
+      // tap is GlobalHook first - decided in a timer, which does not qualify - and Enter some
+      // 200 ms later, which does. A queued shot therefore fires on that Enter edge.
+      if (this.pendingShot && code === 'Enter' && type === 'up') {
+        this.pendingShot = false;
+        stopTimer(this.shotTimer);
+        this.shotTimer = null;
+        this.report('poker', 'shot:enter');
+        return this.shoot();
+      }
       const action = this.gesture(type, code, !!event.repeat);
       const now = Date.now();
       this.report('key', type + ':' + code + ':' + action, this.lastKeyAt ? now - this.lastKeyAt : 0);
@@ -581,7 +617,9 @@ export default {
       if (action !== 'act') return;
       if (code === 'Backspace') return this.back();
       if (DIRECTION_KEYS.includes(code)) return this.step(FORWARD_KEYS.includes(code) ? 1 : -1);
-      return this.confirm();
+      // Inside a key handler, so a camera shot started from here has a valid call site.
+      this.inHandler = true;
+      try { return this.confirm(); } finally { this.inHandler = false; }
     });
   },
 
@@ -658,9 +696,11 @@ export default {
   tapAction(event) {
     const index = Number(event && event.currentTarget && event.currentTarget.dataset && event.currentTarget.dataset.index);
     return this.guard('tap', () => {
-      if (this.tapIgnored() || !Number.isInteger(index) || index < 0 || index >= ACTIONS.length) return;
+      const list = this.screen === 'noob' ? NOOB_ACTIONS : ACTIONS;
+      if (this.tapIgnored() || !Number.isInteger(index) || index < 0 || index >= list.length) return;
       this.selected = index;
-      return this.confirm();
+      this.inHandler = true;
+      try { return this.confirm(); } finally { this.inHandler = false; }
     });
   },
 
@@ -677,7 +717,8 @@ export default {
     return this.guard('tap', () => {
       if (this.tapIgnored()) return;
       this.report('key', 'tap', 0);
-      return this.confirm();
+      this.inHandler = true;
+      try { return this.confirm(); } finally { this.inHandler = false; }
     });
   },
 
@@ -699,6 +740,12 @@ export default {
     } else if (this.screen === 'info') {
       this.offset = Math.max(0, Math.min(this.maxOffset || 0, this.offset + delta * READ_STEP_ROWS));
       this.renderBody();
+    } else if (this.screen === 'noob') {
+      // Three buttons and a short screen: a swipe picks the button, nothing scrolls.
+      const next = Math.max(0, Math.min(NOOB_ACTIONS.length - 1, (this.selected || 0) + delta));
+      this.edge = next === this.selected ? (delta < 0 ? '‹ начало' : '› конец') : '';
+      this.selected = next;
+      this.render();
     } else if (this.selected === 1) {
       // On "Меню": back returns to the conversation, forward stays.
       if (delta < 0) { this.selected = 0; this.render(); }
@@ -729,6 +776,8 @@ export default {
       this.press('menu:' + this.menuIndex);
       return this.activateMenu();
     }
+    // The camera probe lives on the info screen, where a tap takes a test photo.
+    if (this.screen === 'info' && this.cameraTest) return this.noobShot();
     if (this.screen === 'info') return this.back();
     this.press('action:' + this.selected);
     return this.activate();
@@ -781,6 +830,7 @@ export default {
   },
 
   activate() {
+    if (this.screen === 'noob') return this.noobAction(NOOB_ACTIONS[this.selected] || 'shot');
     const action = ACTIONS[this.selected];
     if (action === 'menu') {
       this.selected = 0;
@@ -791,6 +841,11 @@ export default {
 
   goMain() {
     this.stopMicTest();
+    this.cameraTest = false;
+    this.pendingShot = false;
+    stopTimer(this.shotTimer);
+    this.shotTimer = null;
+    if (this.screen === 'noob') this.selected = 0;
     const leavingMenu = this.screen === 'menu' || this.screen === 'info';
     this.screen = 'main';
     this.menuLevel = 'main';
@@ -810,6 +865,347 @@ export default {
     return this.startVoice(false);
   },
 
+  // ---- НУБ: the poker trainer -----------------------------------------
+
+  openNoob() {
+    this.stopMicTest();
+    this.stopVoice();
+    this.cancelChat();
+    this.cameraTest = false;
+    this.screen = 'noob';
+    this.menuLevel = 'main';
+    this.selected = 0;
+    this.edge = '';
+    this.offset = 0;
+    const saved = readLocal(NOOB_KEY);
+    const players = saved && Number.isInteger(saved.players) ? saved.players : 4;
+    this.noob = {
+      players: Math.max(2, Math.min(9, players)),
+      hole: [], board: [], uncertain: [], dropped: [], streets: 0,
+      advice: null, stale: false,
+      note: 'Положите карты в кадр и коснитесь «Снять».'
+    };
+    this.report('poker', 'open:players=' + this.noob.players);
+    this.render();
+  },
+
+  noobAction(id) {
+    if (id === 'hand') return this.noobNewHand();
+    if (id === 'fold') return this.noobFold();
+    return this.noobShot();
+  },
+
+  async noobNewHand() {
+    const noob = this.noob;
+    if (!noob || this.shooting) return;
+    noob.hole = [];
+    noob.board = [];
+    noob.uncertain = [];
+    noob.dropped = [];
+    noob.streets = 0;
+    noob.advice = null;
+    noob.stale = false;
+    noob.note = 'Новая раздача. Снимите свои карты.';
+    this.report('poker', 'hand:new');
+    this.renderNoob();
+    if (!this.connection) return;
+    try {
+      const result = await this.authed('/v1/poker/new', {
+        body: { user_id: this.connection.userId, device_id: this.connection.deviceId, players: noob.players }
+      });
+      if (result && result.data && typeof result.data.hand_id === 'string') noob.handId = result.data.hand_id;
+    } catch (_) {
+      // A new hand is local anyway: the next photo starts one on the server.
+    }
+  },
+
+  noobFold() {
+    const noob = this.noob;
+    if (!noob) return;
+    if (noob.players <= 2) {
+      noob.note = 'Меньше двух игроков не бывает.';
+      return this.renderNoob();
+    }
+    noob.players -= 1;
+    writeLocal(NOOB_KEY, { players: noob.players });
+    this.report('poker', 'fold:players=' + noob.players);
+    // The numbers on the screen were computed against more opponents, so they are stale now.
+    noob.stale = !!noob.advice;
+    noob.note = 'Игроков ' + noob.players + '. Переснимите, чтобы пересчитать.';
+    this.renderNoob();
+  },
+
+  noobShot() {
+    if (this.shooting) return;
+    if (this.inHandler) return this.shoot();
+    // Not in an interaction handler: wait for the Enter edge of this same physical tap.
+    this.pendingShot = true;
+    stopTimer(this.shotTimer);
+    this.shotTimer = setTimeout(() => {
+      this.shotTimer = null;
+      if (!this.pendingShot) return;
+      this.pendingShot = false;
+      this.report('poker', 'shot:timer');
+      return this.guard('shot', () => this.shoot());
+    }, SHOT_FALLBACK_MS);
+    return this.shotStatus('Снимаю…');
+  },
+
+  // Must stay synchronous up to takePhoto(): the runtime refuses the call anywhere else.
+  shoot() {
+    if (this.shooting) return;
+    const camera = wx && wx.media && typeof wx.media.createCameraContext === 'function'
+      ? wx.media.createCameraContext() : null;
+    if (!camera || typeof camera.takePhoto !== 'function') {
+      this.report('camera', camera ? 'no_takephoto' : (wxMissing ? 'no_wx' : 'no_context'));
+      return this.shotFailed('Камера недоступна на этой прошивке. Проверьте Сервис → Зонд камеры.');
+    }
+    let promise;
+    try {
+      // The options argument is not optional: the runtime refuses a call with no arguments
+      // ("Error calling function with 0 argument(s)"), though the documentation never says so.
+      promise = camera.takePhoto({});
+    } catch (error) {
+      this.report('camera', 'throw:' + safeToken(String(error && (error.message || error.name) || error)).slice(0, 40));
+      return this.shotFailed('Камера отказала. Подробности — в Сервис → Зонд камеры.');
+    }
+    this.shooting = true;
+    this.shotStatus('Снимаю…');
+    return Promise.resolve(promise).then(
+      photo => this.photoTaken(photo),
+      error => {
+        this.report('camera', 'reject:' + safeToken(String(error && (error.message || error.name) || error)).slice(0, 40));
+        return this.shotFailed('Снимок не получился. Повторите.');
+      }
+    );
+  },
+
+  photoTaken(photo) {
+    const data = photo && (photo.data || photo.buffer) || photo;
+    const mime = photo && typeof photo.mimeType === 'string' ? photo.mimeType : 'image/jpeg';
+    const size = data && typeof data.byteLength === 'number' ? data.byteLength : 0;
+    this.report('camera', 'photo:' + safeToken(mime), size);
+    if (this.cameraTest) {
+      this.shooting = false;
+      return this.cameraResult(mime, size);
+    }
+    if (!size) return this.shotFailed('Снимок пустой. Повторите.');
+    if (size > PHOTO_MAX_BYTES) {
+      // Nothing here can shrink it: there is no image decoder in this runtime.
+      return this.shotFailed('Снимок ' + Math.round(size / 1024) + ' КБ — больше лимита сервера '
+        + Math.round(PHOTO_MAX_BYTES / 1024) + ' КБ.');
+    }
+    return this.sendPhoto(base64(data), mime);
+  },
+
+  async sendPhoto(encoded, mime) {
+    const noob = this.noob;
+    try {
+      if (!this.connection && !(await this.connect({ silent: true }))) {
+        return this.shotStatus('Нет связи с Neo. Откройте НЕО и нажмите «Подключить».');
+      }
+      const result = await this.pokerStream({
+        user_id: this.connection.userId,
+        device_id: this.connection.deviceId,
+        players: noob.players,
+        image_base64: encoded,
+        mime
+      });
+      if (result && result.error) {
+        this.report('poker', 'error:' + safeToken(result.error.code || 'unknown'));
+        this.shotStatus(result.error.message || 'Сервер не ответил.');
+      }
+    } catch (_) {
+      this.report('poker', 'network');
+      this.shotStatus('Запрос не прошёл. Повторите.');
+    } finally {
+      this.shooting = false;
+      this.renderNoob();
+    }
+  },
+
+  // The same shape as the /v1/ask stream: cards arrive first, numbers after them.
+  async pokerStream(body) {
+    const controller = typeof AbortController === 'function' ? new AbortController() : null;
+    const stop = () => { if (controller) { try { controller.abort(); } catch (_) {} } };
+    let idleTimer = setTimeout(stop, STREAM_IDLE_MS);
+    const keepAlive = () => {
+      stopTimer(idleTimer);
+      idleTimer = setTimeout(stop, STREAM_IDLE_MS);
+    };
+    try {
+      const response = await fetch(NEO_BASE_URL + '/v1/poker/hand', {
+        method: 'POST', timeout: REQUEST_TIMEOUT_MS,
+        headers: { 'Accept': 'text/event-stream', 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + this.connection.token },
+        ...(controller ? { signal: controller.signal } : {}),
+        body: JSON.stringify(body)
+      });
+      if (!response.ok) {
+        let data = null;
+        try { data = await response.json(); } catch (_) {}
+        if (response.status === 401) {
+          this.connection = null;
+          return { error: { code: 'unauthorized', message: 'Доступ истёк. Откройте НЕО и переподключитесь.' } };
+        }
+        return { error: (data && data.error) || { code: 'http_' + response.status, message: 'Сервер отказал (HTTP ' + response.status + ').' } };
+      }
+      let last = null;
+      const handle = event => { keepAlive(); last = event; this.onPokerEvent(event); };
+      const reader = response.body && typeof response.body.getReader === 'function' ? response.body.getReader() : null;
+      if (reader) {
+        const decoder = typeof TextDecoder === 'function' ? new TextDecoder() : null;
+        let buffer = '';
+        for (;;) {
+          const chunk = await reader.read();
+          if (chunk.done) break;
+          buffer += decoder ? decoder.decode(chunk.value, { stream: true }) : String(chunk.value);
+          let split = buffer.indexOf('\n\n');
+          while (split >= 0) {
+            const event = parseEvent(buffer.slice(0, split));
+            buffer = buffer.slice(split + 2);
+            if (event) handle(event);
+            split = buffer.indexOf('\n\n');
+          }
+          if (this.screen !== 'noob') break;
+        }
+      } else {
+        // Hosts without streaming reads still get every event, just at the end.
+        for (const block of String(await response.text()).split('\n\n')) {
+          const event = parseEvent(block);
+          if (event) handle(event);
+        }
+      }
+      if (!last) return { error: { code: 'stream_cut', message: 'Ответ прервался. Повторите.' } };
+      return last.name === 'error' ? { error: last.data } : { done: last.data };
+    } finally {
+      stopTimer(idleTimer);
+    }
+  },
+
+  onPokerEvent(event) {
+    const noob = this.noob;
+    if (!noob || !event) return;
+    const data = event.data || {};
+    if (event.name === 'reading') {
+      noob.note = 'Смотрю на стол…';
+      return this.renderNoob();
+    }
+    if (event.name === 'cards') {
+      noob.handId = typeof data.hand_id === 'string' ? data.hand_id : noob.handId;
+      noob.hole = Array.isArray(data.hole) ? data.hole : [];
+      noob.board = Array.isArray(data.board) ? data.board : [];
+      noob.uncertain = Array.isArray(data.uncertain) ? data.uncertain : [];
+      noob.dropped = Array.isArray(data.dropped) ? data.dropped : [];
+      if (data.new_street) noob.streets += 1;
+      noob.stale = false;
+      noob.advice = null;
+      noob.note = noob.uncertain.length
+        ? 'Не уверен: ' + noob.uncertain.join(' ') + '. Переснимите.'
+        : 'Считаю…';
+      return this.renderNoob();
+    }
+    if (event.name === 'advice') {
+      noob.advice = data;
+      noob.note = '';
+      return this.renderNoob();
+    }
+    if (event.name === 'error') {
+      noob.note = typeof data.message === 'string' ? data.message : 'Ошибка.';
+      return this.renderNoob();
+    }
+  },
+
+  noobRows() {
+    const noob = this.noob || {};
+    const letters = !!(this.prefs && this.prefs.letters);
+    const show = list => (list || []).map(card => letters ? suitLetters(card) : card).join(' ');
+    const advice = noob.stale ? null : noob.advice;
+    const list = [];
+    list.push({ cls: 'section', text: 'НУБ · игроков ' + (noob.players || 4)
+      + (noob.streets ? ' · улица ' + noob.streets : '') + (noob.stale ? ' · пересчитайте' : '') });
+    if (advice) {
+      list.push({ cls: 'big', text: advice.verdict + ' · ' + advice.equity + '%' });
+      list.push({ cls: 'tag', text: 'без учёта банка · ±' + advice.error + ' п.п. · ' + advice.trials + ' прогонов' });
+    }
+    const cards = show(noob.hole) || '—';
+    list.push({ cls: 'data', text: cards + (noob.board && noob.board.length ? '   ' + show(noob.board) : '') });
+    if (advice) {
+      list.push({ cls: 'line', text: advice.hand + (advice.draw ? ' · дро' : '') });
+      if (advice.to_come > 0) {
+        const groups = Object.keys(advice.outs_groups || {}).map(name => name + ' ' + advice.outs_groups[name]).join(', ');
+        list.push({ cls: 'small', text: 'ауты ' + advice.outs + ' (сильных ' + advice.outs_strong + ')'
+          + (groups ? ': ' + groups : '') });
+        list.push({ cls: 'small', text: advice.hit_next + '% к следующей карте, ' + advice.hit_river + '% к ривру' });
+      }
+      list.push({ cls: 'small', text: 'доля по-честному ' + advice.fair + '% · у вас ×' + advice.ratio });
+    }
+    if (noob.dropped && noob.dropped.length) {
+      list.push({ cls: 'small', text: 'на фото не видно ' + show(noob.dropped) + ' — считаю их на столе' });
+    }
+    if (noob.note) {
+      if (list.length) list.push({ cls: 'gap', text: ' ' });
+      for (const row of rows(noob.note, 'line')) list.push(row);
+    }
+    return list;
+  },
+
+  renderNoob() {
+    if (this.screen === 'noob') this.renderBody();
+  },
+
+  shotStatus(text) {
+    if (this.cameraTest) {
+      this.infoText = this.infoText.slice(0, 7).concat(text);
+      return this.renderBody();
+    }
+    if (this.noob) this.noob.note = text;
+    return this.renderNoob();
+  },
+
+  shotFailed(text) {
+    this.shooting = false;
+    return this.shotStatus(text);
+  },
+
+  // The probe answers the two questions no document answers: does this firmware have a camera
+  // at all, and does it draw card glyphs. Both have to be seen on the glasses.
+  startCameraTest() {
+    this.stopMicTest();
+    this.stopVoice();
+    this.cancelChat();
+    this.cameraTest = true;
+    this.screen = 'info';
+    this.menuLevel = 'service';
+    this.offset = 0;
+    const media = wx && wx.media;
+    const context = media && typeof media.createCameraContext === 'function' ? media.createCameraContext() : null;
+    this.infoText = [
+      'ЗОНД КАМЕРЫ И МАСТЕЙ',
+      'символы:  A♠  K♥  7♦  T♣',
+      'буквы:    Aп  Kч  7б  Tк',
+      'Пустые места в строке символов = включите Масти НУБ: буквы.',
+      'wx: ' + (wx ? 'есть' : wxMissing ? 'НЕТ модуля' : 'не загружен')
+        + ' / media: ' + (media ? 'есть' : 'НЕТ')
+        + ' / createCameraContext: ' + (media && typeof media.createCameraContext === 'function' ? 'есть' : 'НЕТ'),
+      'контекст: ' + (context ? 'получен' : 'undefined')
+        + ' / takePhoto: ' + (context && typeof context.takePhoto === 'function' ? 'есть' : 'НЕТ'),
+      'Коснитесь, чтобы снять пробное фото.'
+    ];
+    this.report('camera', 'probe:context=' + (context ? 'yes' : 'no') + ':wx=' + (wx ? 'yes' : 'no'));
+    this.setPhase('paused', 'Зонд камеры.');
+  },
+
+  cameraResult(mime, size) {
+    this.infoText = this.infoText.slice(0, 7).concat([
+      'ФОТО: ' + (size ? 'получено' : 'ПУСТО') + ' / ' + mime + ' / ' + size + ' байт = ' + Math.round(size / 1024) + ' КБ',
+      size > PHOTO_MAX_BYTES
+        ? 'БОЛЬШЕ лимита сервера ' + Math.round(PHOTO_MAX_BYTES / 1024) + ' КБ: сжать нечем, нужен лимит выше.'
+        : 'Размер в пределах лимита сервера.'
+    ]);
+    this.flushEvents();
+    this.renderBody();
+  },
+
   // ---- settings ------------------------------------------------------
 
   menuItems() {
@@ -817,6 +1213,7 @@ export default {
     if (this.menuLevel === 'service') {
       return [
         { id: 'mictest', label: 'Тест микрофона', value: '' },
+        { id: 'camera', label: 'Зонд камеры', value: '' },
         { id: 'diagnostics', label: 'Проверка устройства', value: '' },
         { id: 'reconnect', label: 'Переподключить', value: '' },
         { id: 'up', label: '‹ Назад', value: '' }
@@ -826,6 +1223,8 @@ export default {
       { id: 'voice', label: 'Голос ответа', value: p.voice === 'off' ? 'выключен' : 'включён' },
       { id: 'talk', label: 'Разговор', value: p.talk === 'tap' ? 'по касанию' : 'непрерывный' },
       { id: 'sensitive', label: 'Микрофон', value: p.sensitive ? 'тихая речь' : 'обычный' },
+      { id: 'noob', label: 'НУБ — покер', value: this.noob ? 'игроков ' + this.noob.players : '' },
+      { id: 'suits', label: 'Масти НУБ', value: p.letters ? 'буквы' : 'символы' },
       { id: 'new', label: 'Новый разговор', value: '' },
       { id: 'memory', label: 'Показать память', value: '' },
       { id: 'service', label: 'Сервис', value: '›' },
@@ -880,12 +1279,15 @@ export default {
     if (item.id === 'voice') p.voice = p.voice === 'off' ? 'on' : 'off';
     else if (item.id === 'talk') p.talk = p.talk === 'tap' ? 'continuous' : 'tap';
     else if (item.id === 'sensitive') p.sensitive = !p.sensitive;
+    else if (item.id === 'suits') p.letters = !p.letters;
+    else if (item.id === 'noob') return this.openNoob();
     else if (item.id === 'new') return this.newConversation();
     else if (item.id === 'memory') { this.goMain(); return this.ask('покажи память', null); }
     else if (item.id === 'service') return this.openMenu('service');
     else if (item.id === 'up') return this.openMenu('main', 'service');
     else if (item.id === 'diagnostics') { this.returnItem = 'diagnostics'; return this.showDiagnostics(); }
     else if (item.id === 'mictest') { this.returnItem = 'mictest'; return this.startMicTest('wx'); }
+    else if (item.id === 'camera') { this.returnItem = 'camera'; return this.startCameraTest(); }
     else if (item.id === 'reconnect') { this.connection = null; this.goMain(); return this.connect({ ask: true }); }
     else if (item.id === 'back') return this.goMain();
     if (item.id === 'voice' && p.voice === 'on') this.speakRokid('Голос включён.', null);
@@ -1920,6 +2322,9 @@ export default {
   transition: top 140ms, height 140ms;
 }
 .line { color: #40ff5e; font-size: 16px; line-height: 23px; }
+.big { color: #40ff5e; font-size: 22px; line-height: 28px; font-weight: 500; }
+.tag { color: rgba(64,255,94,0.48); font-size: 10px; line-height: 14px; }
+.data { color: rgba(64,255,94,0.9); font-family: monospace; font-size: 13px; line-height: 20px; }
 .small { color: rgba(64,255,94,0.55); font-size: 12px; line-height: 17px; }
 .gap { font-size: 4px; line-height: 8px; }
 .section { color: rgba(64,255,94,0.48); font-size: 11px; line-height: 16px; }
@@ -1985,6 +2390,7 @@ export default {
   border-radius: 4px;
   flex-shrink: 0;
 }
+.action-3 { width: 88px; }
 .action-on { background-color: rgba(64,255,94,0.12); border: 2px solid #40ff5e; }
 .press { background-color: rgba(64,255,94,0.36); }
 .action-label { color: #40ff5e; font-size: 14px; font-weight: 500; }

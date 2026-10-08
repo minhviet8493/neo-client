@@ -48,6 +48,23 @@ function askEvents(message = 'Ответ Neo.', extra = {}) {
   ];
 }
 
+// A НУБ stream, as /v1/poker/hand returns it: the cards first, the numbers after them.
+function pokerEvents(overrides = {}) {
+  const cards = Object.assign({
+    hand_id: 'h'.repeat(12), hole: ['A\u2665', 'K\u2665'], board: ['7\u2665', '2\u2665', '3\u2660'],
+    players: 4, uncertain: [], added: [], dropped: [], new_street: true, request_id: ID
+  }, overrides.cards || {});
+  const advice = Object.assign({
+    verdict: 'ВПЕРЕДИ', equity: 52, error: 1, trials: 10000, fair: 25, ratio: 2.08,
+    hand: 'старшая карта', outs: 15, outs_strong: 9, outs_groups: { 'флеш': 9, 'пара': 6 },
+    hit_next: 32, hit_river: 54, to_come: 2, draw: true, pot_aware: false,
+    hole: cards.hole, board: cards.board, players: cards.players, request_id: ID
+  }, overrides.advice || {});
+  const events = [['reading', { request_id: ID, bytes: 4096 }], ['cards', cards]];
+  events.push(overrides.error ? ['error', overrides.error] : ['advice', advice]);
+  return events;
+}
+
 function response(status, body, binary) {
   return {
     ok: status >= 200 && status < 300, status,
@@ -74,7 +91,9 @@ function host(options = {}) {
     '/v1/transcribe': () => response(200, { text: 'Привет, Нео', request_id: ID }),
     '/v1/speech': () => response(200, undefined, new Int16Array(2400).buffer),
     '/v1/diagnostics': () => response(204),
-    '/v1/ask': () => sseResponse(askEvents())
+    '/v1/ask': () => sseResponse(askEvents()),
+    '/v1/poker/new': () => response(200, { hand_id: 'n'.repeat(12), players: 3, request_id: ID }),
+    '/v1/poker/hand': () => sseResponse(pokerEvents(options.poker || {}))
   }, options.routes || {});
 
   class FakeDate extends Date { static now() { return now; } }
@@ -108,6 +127,20 @@ function host(options = {}) {
     onStop(fn) { this.handlers.stop = fn; }
   };
   const played = [];
+  // The camera, as the documentation describes it: a single photo, an ArrayBuffer, and a call
+  // that is only accepted from an interaction handler.
+  const photos = [];
+  const camera = {
+    takePhoto(request) {
+      // The real runtime refuses a call with no arguments, so the fake refuses one too.
+      if (request === undefined) throw new Error('Error calling function with 0 argument(s)');
+      photos.push(now);
+      if (options.photoThrows) throw new Error('interaction gate check failed');
+      if (options.photoRejects) return Promise.reject(new Error('camera busy'));
+      const size = options.photoBytes || 4096;
+      return Promise.resolve({ data: new Uint8Array(size).fill(7).buffer, mimeType: options.photoMime || 'image/jpeg' });
+    }
+  };
   const globals = {
     console: { log() {}, error() {} },
     Date: FakeDate,
@@ -136,6 +169,7 @@ function host(options = {}) {
   };
   if (!options.noWx) {
     globals.wx = { media: { getRecorderManager: () => options.noRecorder ? undefined : recorder } };
+    if (!options.noCamera) globals.wx.media.createCameraContext = () => options.noContext ? undefined : camera;
     if (!options.noBase64) globals.wx.arrayBufferToBase64 = buffer => Buffer.from(buffer).toString('base64');
   }
   if (options.hostRecognition) globals.SpeechRecognition = FakeRecognition;
@@ -172,7 +206,7 @@ function host(options = {}) {
   page.setData = patch => Object.assign(page.data, patch);
 
   const env = {
-    page, requests, recognitions, recorder, storage, played, timers,
+    page, requests, recognitions, recorder, storage, played, timers, photos,
     get now() { return now; },
     last: () => recognitions[recognitions.length - 1],
     async advance(ms) {
@@ -798,8 +832,8 @@ test('the menu has two short levels, stops at its ends and persists settings', a
   await env.advance(1000);
   await glassesTap(env);
   assert.equal(env.page.data.screen, 'menu');
-  assert.deepEqual(plain(env.page.menuItems().map(item => item.id)), ['voice', 'talk', 'sensitive', 'new', 'memory', 'service', 'back']);
-  assert.match(env.page.data.menuTitle, /^НАСТРОЙКИ {2}1\/7 ▼$/);
+  assert.deepEqual(plain(env.page.menuItems().map(item => item.id)), ['voice', 'talk', 'sensitive', 'noob', 'suits', 'new', 'memory', 'service', 'back']);
+  assert.match(env.page.data.menuTitle, /^НАСТРОЙКИ {2}1\/9 ▼$/);
   glassesSwipe(env, false);
   await env.advance(1000);
   assert.match(env.page.data.menuTitle, /▲ начало/);
@@ -817,18 +851,18 @@ test('the menu has two short levels, stops at its ends and persists settings', a
   await env.advance(1000);
   assert.equal(menuFocus(env), 'sensitive');
   await glassesTap(env);
-  assert.deepEqual(JSON.parse(env.storage.get(PREFS)), { voice: 'on', talk: 'continuous', sensitive: true });
+  assert.deepEqual(JSON.parse(env.storage.get(PREFS)), { voice: 'on', talk: 'continuous', sensitive: true, letters: false });
   for (let i = 0; i < 8; i++) { await env.advance(1000); glassesSwipe(env, true); }
   await env.advance(1000);
   assert.equal(menuFocus(env), 'back');
-  assert.match(env.page.data.menuTitle, /7\/7.*▼ конец/);
+  assert.match(env.page.data.menuTitle, /9\/9.*▼ конец/);
   glassesSwipe(env, false);
   await env.advance(1000);
   assert.equal(menuFocus(env), 'service');
   await env.advance(1000);
   await glassesTap(env);
   assert.match(env.page.data.menuTitle, /^СЕРВИС/);
-  assert.deepEqual(plain(env.page.menuItems().map(item => item.id)), ['mictest', 'diagnostics', 'reconnect', 'up']);
+  assert.deepEqual(plain(env.page.menuItems().map(item => item.id)), ['mictest', 'camera', 'diagnostics', 'reconnect', 'up']);
   const back = env.key('Backspace');
   assert.equal(back.prevented, true);
   assert.match(env.page.data.menuTitle, /^НАСТРОЙКИ/);
@@ -933,11 +967,11 @@ test('telemetry carries only technical tokens, transliterated', async () => {
 
 test('older settings migrate to voice on/off', async () => {
   const env = await ready({ storage: { 'neo.preferences.v4': JSON.stringify({ voice: 'neo', mode: 'tap', sensitive: true, search: false }) } });
-  assert.deepEqual(plain(env.page.prefs), { voice: 'on', talk: 'tap', sensitive: true });
+  assert.deepEqual(plain(env.page.prefs), { voice: 'on', talk: 'tap', sensitive: true, letters: false });
   const off = await ready({ storage: { 'neo.preferences.v4': JSON.stringify({ voice: 'off' }) } });
   assert.equal(off.page.prefs.voice, 'off');
   const fresh = await ready();
-  assert.deepEqual(plain(fresh.page.prefs), { voice: 'on', talk: 'continuous', sensitive: false });
+  assert.deepEqual(plain(fresh.page.prefs), { voice: 'on', talk: 'continuous', sensitive: false, letters: false });
 });
 
 test('template bindings and handlers exist', () => {
@@ -1020,4 +1054,176 @@ test('an enrollment from before 4.0 is dropped, not silently reused', async () =
   const env = await ready({ storage: { 'neo.device.v1': JSON.stringify({ refresh_token: 'x'.repeat(64) }) } });
   assert.equal(env.storage.get('neo.device.v1'), undefined);
   assert.equal(env.requests.filter(r => r.body && r.body.refresh_token === 'x'.repeat(64)).length, 0);
+});
+
+// ---- НУБ: the poker trainer ---------------------------------------------
+
+async function noob(options = {}) {
+  const env = await ready(options);
+  env.page.openMenu('main', 'noob');
+  await flush();
+  await glassesTap(env);
+  await flush();
+  assert.equal(env.page.data.screen, 'noob', 'the menu did not open НУБ');
+  // The opening tap is still inside the twin window; let it pass before the test taps again.
+  await env.advance(1000);
+  return env;
+}
+
+const noobRows = env => env.page.data.bodyLines.map(line => line.cls + ': ' + line.text);
+const pokerShots = env => env.requests.filter(r => r.route === '/v1/poker/hand');
+
+test('НУБ opens from the menu with three buttons and no numbers yet', async () => {
+  const env = await noob();
+  assert.deepEqual(plain(env.page.data.actions.map(a => a.label)), ['Снять', 'Раздача', 'Игроков −1']);
+  assert.ok(env.page.data.actions.every(a => a.cls.includes('action-3')), 'three buttons need the narrow class');
+  assert.equal(selected(env), 0);
+  assert.match(noobRows(env).join('\n'), /НУБ · игроков 4/);
+  assert.match(noobRows(env).join('\n'), /коснитесь/i);
+  assert.equal(pokerShots(env).length, 0, 'opening the screen must not send anything');
+});
+
+test('a tap on Снять photographs the table and answers with cards, then numbers', async () => {
+  const env = await noob();
+  await env.tap();
+  await flush();
+  assert.equal(env.photos.length, 1, 'exactly one photo per tap');
+  const shot = pokerShots(env)[0];
+  assert.equal(shot.body.players, 4);
+  assert.equal(shot.body.mime, 'image/jpeg');
+  assert.ok(shot.body.image_base64.length > 64);
+  assert.equal(shot.init.headers.Accept, 'text/event-stream');
+  const screen = noobRows(env);
+  assert.ok(screen.some(row => row.startsWith('big: ВПЕРЕДИ · 52%')), screen.join('\n'));
+  assert.ok(screen.some(row => row.startsWith('tag: без учёта банка')), 'the pot disclaimer must be on screen');
+  assert.ok(screen.some(row => row.includes('A♥ K♥')), 'the cards it read must be shown');
+  assert.ok(screen.some(row => row.includes('ауты 15 (сильных 9): флеш 9, пара 6')), screen.join('\n'));
+  assert.ok(screen.some(row => row.includes('32% к следующей карте, 54% к ривру')), screen.join('\n'));
+  assert.ok(screen.some(row => row.includes('доля по-честному 25%')), screen.join('\n'));
+});
+
+test('on the glasses the photo is taken on the Enter edge, not from the tap timer', async () => {
+  const env = await noob();
+  env.key('GlobalHook');
+  await env.advance(480);
+  // The hook timer decided "this is a tap", which is not a call site the camera accepts.
+  assert.equal(env.photos.length, 0, 'nothing may be photographed from a timer');
+  assert.match(noobRows(env).join('\n'), /Снимаю/);
+  env.key('Enter');
+  await flush();
+  assert.equal(env.photos.length, 1, 'the Enter edge of the same tap must take the photo');
+  await env.advance(9000);
+  assert.match(telemetry(env), /shot:enter/);
+  assert.ok(!/shot:timer/.test(telemetry(env)), 'the fallback timer must not have fired');
+});
+
+test('without an Enter the fallback timer still tries, and says so in telemetry', async () => {
+  const env = await noob();
+  env.key('GlobalHook');
+  await env.advance(1500);
+  assert.equal(env.photos.length, 1);
+  await env.advance(9000);
+  assert.match(telemetry(env), /shot:timer/);
+});
+
+test('an uncertain card blocks the numbers and asks for another photo', async () => {
+  const env = await noob({
+    poker: {
+      cards: { board: ['7♥'], uncertain: ['7♥'], new_street: true },
+      error: { code: 'vision_uncertain', message: 'Не уверен в карте. Переснимите.' }
+    }
+  });
+  await env.tap();
+  await flush();
+  const screen = noobRows(env).join('\n');
+  assert.ok(!/big:/.test(screen), 'no verdict may be shown for an uncertain reading');
+  assert.match(screen, /Не уверен в карте/);
+});
+
+test('Игроков −1 recomputes nothing by itself and marks the numbers stale', async () => {
+  const env = await noob();
+  await env.tap();
+  await flush();
+  assert.match(noobRows(env).join('\n'), /big: ВПЕРЕДИ/);
+  await env.advance(1000);
+  env.page.selected = 2;
+  await env.tap();
+  await flush();
+  assert.equal(env.page.noob.players, 3);
+  assert.deepEqual(JSON.parse(env.storage.get('neo.noob.v1')), { players: 3 });
+  const screen = noobRows(env).join('\n');
+  assert.ok(!/big:/.test(screen), 'stale numbers must disappear, not mislead');
+  assert.match(screen, /пересчитайте/);
+  assert.equal(env.photos.length, 1, 'a fold must not take a photo');
+});
+
+test('Раздача clears the board and tells the server a new hand started', async () => {
+  const env = await noob();
+  await env.tap();
+  await flush();
+  await env.advance(1000);
+  env.page.selected = 1;
+  await env.tap();
+  await flush();
+  assert.equal(env.requests.filter(r => r.route === '/v1/poker/new').length, 1);
+  assert.equal(env.page.noob.board.length, 0);
+  assert.equal(env.page.noob.handId, 'n'.repeat(12));
+  assert.match(noobRows(env).join('\n'), /Новая раздача/);
+});
+
+test('a firmware without a camera says so instead of sending anything', async () => {
+  const env = await noob({ noCamera: true });
+  await env.tap();
+  await flush();
+  assert.equal(pokerShots(env).length, 0);
+  assert.match(noobRows(env).join('\n'), /Камера недоступна/);
+  await env.advance(9000);
+  assert.match(telemetry(env), /no_takephoto|no_context/);
+});
+
+test('a refused camera call is reported, not swallowed', async () => {
+  const env = await noob({ photoThrows: true });
+  await env.tap();
+  await flush();
+  assert.equal(pokerShots(env).length, 0);
+  assert.match(noobRows(env).join('\n'), /Камера отказала/);
+  await env.advance(9000);
+  assert.match(telemetry(env), /throw:interaction gate check failed/);
+});
+
+test('a photo over the server limit is refused on the glasses, where nothing can shrink it', async () => {
+  const env = await noob({ photoBytes: 1300000 });
+  await env.tap();
+  await flush();
+  assert.equal(pokerShots(env).length, 0);
+  assert.match(noobRows(env).join('\n'), /больше лимита сервера/);
+});
+
+test('suits fall back to letters when the firmware draws no glyphs', async () => {
+  const env = await noob({ storage: prefs({ voice: 'on', talk: 'continuous', sensitive: false, letters: true }) });
+  await env.tap();
+  await flush();
+  const screen = noobRows(env).join('\n');
+  assert.match(screen, /Aч Kч/);
+  assert.ok(!/♥/.test(screen), 'no glyphs may be left when letters are on');
+});
+
+test('the camera probe reports what the firmware actually has', async () => {
+  const env = await ready();
+  env.page.openMenu('service', 'camera');
+  await flush();
+  await glassesTap(env);
+  await flush();
+  const screen = env.rows().join('\n');
+  assert.match(screen, /ЗОНД КАМЕРЫ/);
+  assert.match(screen, /createCameraContext: есть/);
+  assert.match(screen, /takePhoto: есть/);
+  assert.match(screen, /A♠/, 'the glyph sample must be on screen');
+  assert.match(screen, /Aп/, 'the letter sample must be on screen');
+  await env.advance(1000);
+  await env.tap();
+  await flush();
+  assert.equal(env.photos.length, 1);
+  assert.match(env.rows().join('\n'), /ФОТО: получено \/ image\/jpeg \/ 4096 байт/);
+  assert.equal(pokerShots(env).length, 0, 'the probe must never send a photo anywhere');
 });
